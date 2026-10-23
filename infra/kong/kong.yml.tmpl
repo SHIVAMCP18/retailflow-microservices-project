@@ -1,0 +1,135 @@
+# Kong declarative (DB-less) configuration for the RetailFlow API gateway.
+# render-and-start.sh copies this file to /tmp/kong.yml and replaces the
+# __JWT_PUBLIC_KEY__ line with Customer Service's RS256 public key.
+#
+# Upstream hosts end in ".service.consul": Kong uses Consul as its DNS server
+# (KONG_DNS_RESOLVER), so every request is routed to a healthy instance that
+# registered itself in the discovery service. The SRV record also supplies
+# the port, so no ports are hard-coded here.
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: customer-service
+    host: customer-service.service.consul
+    protocol: http
+    connect_timeout: 3000
+    read_timeout: 10000
+    retries: 2
+    routes:
+      - name: auth
+        paths: [/auth]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins:
+          # Brute-force protection for login and registration.
+          - name: rate-limiting
+            config: { minute: 30, policy: local, limit_by: ip }
+      - name: customers
+        paths: [/customers]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins: [{ name: jwt, config: { key_claim_name: iss, claims_to_verify: [exp] } }]
+
+  - name: product-service
+    host: product-service.service.consul
+    protocol: http
+    retries: 2
+    routes:
+      - name: products
+        paths: [/products, /categories]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins: [{ name: jwt, config: { key_claim_name: iss, claims_to_verify: [exp] } }]
+
+  - name: order-service
+    host: order-service.service.consul
+    protocol: http
+    retries: 1
+    read_timeout: 15000
+    routes:
+      - name: orders
+        paths: [/orders]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins: [{ name: jwt, config: { key_claim_name: iss, claims_to_verify: [exp] } }]
+
+  - name: billing-service
+    host: billing-service.service.consul
+    protocol: http
+    retries: 1
+    routes:
+      - name: billing
+        paths: [/billing]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins: [{ name: jwt, config: { key_claim_name: iss, claims_to_verify: [exp] } }]
+
+  - name: notification-service
+    host: notification-service.service.consul
+    protocol: http
+    retries: 2
+    routes:
+      - name: notifications
+        paths: [/notifications]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+        plugins: [{ name: jwt, config: { key_claim_name: iss, claims_to_verify: [exp] } }]
+
+  # The React website. "/" is public; Kong prefers the longer API paths above,
+  # so only page and asset requests reach this service.
+  - name: web-ui
+    host: web-ui.service.consul
+    protocol: http
+    retries: 2
+    routes:
+      - name: website
+        paths: [/]
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 308
+
+# The JWT plugin finds this consumer through the token's "iss" claim and
+# verifies the RS256 signature with the public key. Kong never sees the
+# private key, so it can validate tokens but cannot mint them.
+consumers:
+  - username: retailflow-users
+    jwt_secrets:
+      - key: retailflow-customer-service
+        algorithm: RS256
+        rsa_public_key: |
+          __JWT_PUBLIC_KEY__
+
+plugins:
+  # Generates X-Request-ID when the client sends none and returns it to the
+  # client; every service logs it and forwards it through gRPC and RabbitMQ.
+  - name: correlation-id
+    config: { header_name: X-Request-ID, generator: uuid, echo_downstream: true }
+  - name: rate-limiting
+    config: { minute: 300, policy: local, limit_by: ip }
+  - name: request-size-limiting
+    config: { allowed_payload_size: 1, size_unit: megabytes }
+  - name: cors
+    config:
+      origins: ["https://localhost:8443"]
+      methods: [GET, POST, PUT, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type, X-Request-ID]
+      exposed_headers: [X-Request-ID]
+      max_age: 3600
+  - name: response-transformer
+    config:
+      add:
+        headers:
+          - "Strict-Transport-Security: max-age=31536000; includeSubDomains"
+          - "X-Content-Type-Options: nosniff"
+          - "X-Frame-Options: DENY"
+          - "Referrer-Policy: no-referrer"
+          - "Cache-Control: no-store"
+  - name: prometheus
+    config: { status_code_metrics: true, latency_metrics: true, upstream_health_metrics: true }

@@ -1,0 +1,95 @@
+server:
+  port: 8083
+  shutdown: graceful
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://order-db:3306/orders}
+    username: order_app
+    password: ${MYSQL_ORDER_PASSWORD}
+  rabbitmq:
+    host: ${RABBITMQ_HOST:rabbitmq}
+    username: ${RABBITMQ_APP_USER}
+    password: ${RABBITMQ_APP_PASSWORD}
+    virtual-host: retailflow
+    listener:
+      simple:
+        # Failed messages are re-queued; the quorum queue's delivery limit moves
+        # them to the dead-letter queue after 5 attempts.
+        default-requeue-rejected: true
+        prefetch: 10
+        # Keep retrying if a queue is not declared yet (e.g. the init job is still running).
+        missing-queues-fatal: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: file:${JWT_PUBLIC_KEY_FILE:/run/secrets/jwt_public_key}
+  cloud:
+    consul:
+      host: ${CONSUL_HOST:consul}
+      port: 8500
+      discovery:
+        instance-id: order-service-${HOSTNAME:local}
+        prefer-ip-address: true
+        ip-address: ${POD_IP:${spring.cloud.client.ip-address}}
+        # Consul calls this every 10 s. The "consul" health group checks the
+        # database but not the circuit breakers, so an open breaker (which is
+        # expected behaviour) doesn't take Order Service out of rotation.
+        health-check-path: /actuator/health/consul
+        health-check-interval: 10s
+        health-check-critical-timeout: 1m
+        # Only hand out instances whose Consul health check is passing.
+        query-passing: true
+        tags: [java]
+        metadata:
+          metrics_path: /actuator/prometheus
+
+# Circuit breakers on both synchronous dependencies. Two failures in the last
+# four calls open the circuit for 15 s; calls then fail fast with a fallback
+# instead of waiting on a dead service.
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 4
+        minimum-number-of-calls: 2
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 1
+        register-health-indicator: true
+    instances:
+      product: { base-config: default }
+      customer:
+        base-config: default
+        ignore-exceptions: [com.retailflow.order.CustomerClient$CustomerNotFound]
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,circuitbreakers,circuitbreakerevents
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+      group:
+        consul:
+          include: db,ping
+  health:
+    circuitbreakers:
+      enabled: true
+    # Consul health checks must not fail just because RabbitMQ is restarting.
+    rabbit:
+      enabled: false
+  metrics:
+    tags:
+      service: order-service
+
+logging:
+  structured:
+    format:
+      console: ecs

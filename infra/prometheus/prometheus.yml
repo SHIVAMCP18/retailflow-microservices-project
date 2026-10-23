@@ -1,0 +1,30 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files: [alerts.yml]
+
+scrape_configs:
+  # Business services are discovered from Consul - no target list to maintain.
+  # Each service publishes its metrics path in its Consul metadata.
+  - job_name: services
+    consul_sd_configs:
+      - server: consul:8500
+    relabel_configs:
+      - source_labels: [__meta_consul_service]
+        regex: .*-service
+        action: keep
+      - source_labels: [__meta_consul_service]
+        target_label: service
+      - source_labels: [__meta_consul_service_metadata_metrics_path]
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__meta_consul_service_id]
+        target_label: instance
+
+  - job_name: kong
+    honor_labels: true   # keep Kong's own per-route "service" label
+    static_configs: [{ targets: ["kong:8100"], labels: { service: api-gateway } }]
+
+  - job_name: rabbitmq
+    static_configs: [{ targets: ["rabbitmq:15692"], labels: { service: rabbitmq } }]

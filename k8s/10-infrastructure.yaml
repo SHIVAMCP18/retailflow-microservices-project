@@ -1,0 +1,203 @@
+# Shared infrastructure: Consul (discovery), RabbitMQ (broker), Kong (API gateway)
+# and Debezium (CDC). ConfigMaps and Secrets referenced here are created by
+# deploy.sh from the same files Docker Compose uses.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: consul, namespace: retailflow, labels: { app: consul } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: consul } }
+  template:
+    metadata: { labels: { app: consul } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: consul
+          image: hashicorp/consul:1.19
+          args: ["agent", "-dev", "-ui", "-client=0.0.0.0", "-log-json"]
+          ports:
+            - { name: http, containerPort: 8500 }
+            - { name: dns-udp, containerPort: 8600, protocol: UDP }
+            - { name: dns-tcp, containerPort: 8600, protocol: TCP }
+          readinessProbe: { httpGet: { path: /v1/status/leader, port: 8500 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: consul, namespace: retailflow }
+spec:
+  # Fixed ClusterIP so Kong can use Consul as its DNS server (Kong needs an IP).
+  # It lies inside the default service range of kind, minikube and Docker Desktop.
+  clusterIP: 10.96.200.10
+  selector: { app: consul }
+  ports:
+    - { name: http, port: 8500 }
+    - { name: dns-udp, port: 8600, protocol: UDP }
+    - { name: dns-tcp, port: 8600, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: rabbitmq, namespace: retailflow, labels: { app: rabbitmq } }
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector: { matchLabels: { app: rabbitmq } }
+  template:
+    metadata: { labels: { app: rabbitmq } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management-alpine
+          env:
+            - { name: RABBITMQ_DEFAULT_USER, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_ADMIN_USER } } }
+            - { name: RABBITMQ_DEFAULT_PASS, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_ADMIN_PASSWORD } } }
+            - { name: RABBITMQ_NODENAME, value: rabbit@localhost }
+          ports:
+            - { name: amqp, containerPort: 5672 }
+            - { name: management, containerPort: 15672 }
+            - { name: metrics, containerPort: 15692 }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/rabbitmq }
+            - { name: config, mountPath: /etc/rabbitmq/conf.d/20-prometheus.conf, subPath: 20-prometheus.conf }
+          readinessProbe:
+            exec: { command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"] }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 10
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 768Mi } }
+      volumes:
+        - { name: config, configMap: { name: rabbitmq-config } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rabbitmq, namespace: retailflow }
+spec:
+  selector: { app: rabbitmq }
+  ports:
+    - { name: amqp, port: 5672 }
+    - { name: management, port: 15672 }
+    - { name: metrics, port: 15692 }
+---
+# One-off job that declares exchanges, quorum queues, dead-letter queues and the
+# restricted application user (same script as Docker Compose).
+apiVersion: batch/v1
+kind: Job
+metadata: { name: rabbitmq-init, namespace: retailflow }
+spec:
+  backoffLimit: 10
+  template:
+    metadata: { labels: { app: rabbitmq-init } }
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      containers:
+        - name: init
+          image: curlimages/curl:8.10.1
+          command: ["sh", "/scripts/init-topology.sh"]
+          envFrom: [{ secretRef: { name: app-secrets } }]
+          volumeMounts: [{ name: scripts, mountPath: /scripts }]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - { name: scripts, configMap: { name: rabbitmq-config } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: kong, namespace: retailflow, labels: { app: kong } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: kong } }
+  template:
+    metadata: { labels: { app: kong } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: kong
+          image: kong:3.9
+          command: ["sh", "/kong/render-and-start.sh"]
+          env:
+            - { name: KONG_DATABASE, value: "off" }
+            - { name: KONG_PROXY_LISTEN, value: "0.0.0.0:8443 ssl http2" }
+            - { name: KONG_SSL_CERT, value: /run/tls/tls.crt }
+            - { name: KONG_SSL_CERT_KEY, value: /run/tls/tls.key }
+            - { name: KONG_ADMIN_LISTEN, value: "off" }
+            - { name: KONG_STATUS_LISTEN, value: "0.0.0.0:8100" }
+            - { name: KONG_DNS_RESOLVER, value: "10.96.200.10:8600" }
+            - { name: KONG_DNS_ORDER, value: "SRV,A" }
+            - { name: KONG_HEADERS, value: "off" }
+            - { name: KONG_PROXY_ACCESS_LOG, value: /dev/stdout }
+            - { name: KONG_PROXY_ERROR_LOG, value: /dev/stderr }
+            - { name: KONG_PREFIX, value: /tmp/kong }
+          ports:
+            - { name: https, containerPort: 8443 }
+            - { name: status, containerPort: 8100 }
+          volumeMounts:
+            - { name: config, mountPath: /kong }
+            - { name: jwt-public, mountPath: /run/secrets }
+            - { name: tls, mountPath: /run/tls }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe: { httpGet: { path: /status, port: 8100 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /status, port: 8100 }, initialDelaySeconds: 20, periodSeconds: 10 }
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 512Mi } }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+            runAsUser: 1001
+            readOnlyRootFilesystem: true
+      volumes:
+        - { name: config, configMap: { name: kong-config } }
+        - { name: jwt-public, secret: { secretName: jwt-public } }
+        - { name: tls, secret: { secretName: gateway-tls } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: kong, namespace: retailflow }
+spec:
+  type: NodePort
+  selector: { app: kong }
+  ports:
+    - { name: https, port: 8443, targetPort: 8443, nodePort: 30443 }
+    - { name: status, port: 8100 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: debezium, namespace: retailflow, labels: { app: debezium } }
+spec:
+  serviceName: debezium
+  replicas: 1
+  selector: { matchLabels: { app: debezium } }
+  template:
+    metadata: { labels: { app: debezium } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { fsGroup: 185 }
+      containers:
+        - name: debezium
+          image: debezium/server:2.7.3.Final
+          envFrom: [{ secretRef: { name: app-secrets } }]
+          volumeMounts:
+            - { name: config, mountPath: /debezium/conf }
+            - { name: data, mountPath: /debezium/data }
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 768Mi } }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+            runAsUser: 185
+      volumes:
+        - { name: config, configMap: { name: debezium-config } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 100Mi } } }

@@ -1,0 +1,301 @@
+{
+ "uid": "retailflow",
+ "title": "RetailFlow overview",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "10s",
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "title": "Service health (1 = up)",
+   "type": "stat",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 4
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "up",
+     "legendFormat": "{{service}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "L"
+    }
+   ],
+   "options": {
+    "colorMode": "background",
+    "textMode": "value_and_name",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 2,
+   "title": "Gateway requests / s by service",
+   "type": "timeseries",
+   "gridPos": {
+    "x": 0,
+    "y": 4,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "sum by (service) (rate(kong_http_requests_total[1m]))",
+     "legendFormat": "{{service}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "L"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "title": "Gateway responses by status code",
+   "type": "timeseries",
+   "gridPos": {
+    "x": 12,
+    "y": 4,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "sum by (code) (rate(kong_http_requests_total[1m]))",
+     "legendFormat": "{{code}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "I"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "title": "Gateway latency p95 (ms)",
+   "type": "timeseries",
+   "gridPos": {
+    "x": 0,
+    "y": 12,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.95, sum by (le, service) (rate(kong_request_latency_ms_bucket[5m])))",
+     "legendFormat": "{{service}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "L"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "title": "Circuit breakers (Order Service)",
+   "type": "stat",
+   "gridPos": {
+    "x": 12,
+    "y": 12,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "max by (name, state) (resilience4j_circuitbreaker_state) == 1",
+     "legendFormat": "{{name}}: {{state}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "T"
+    }
+   ],
+   "options": {
+    "colorMode": "background",
+    "textMode": "name",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 6,
+   "title": "RabbitMQ messages waiting per queue",
+   "type": "timeseries",
+   "gridPos": {
+    "x": 0,
+    "y": 20,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "sum by (queue) (rabbitmq_queue_messages_ready)",
+     "legendFormat": "{{queue}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "J"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "title": "Business events",
+   "type": "timeseries",
+   "gridPos": {
+    "x": 12,
+    "y": 20,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(stock_reservations_total[5m])) * 60",
+     "legendFormat": "stock reservations / min",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "Y"
+    },
+    {
+     "expr": "sum(rate(billing_invoices_created_total[5m])) * 60",
+     "legendFormat": "invoices / min",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "O"
+    },
+    {
+     "expr": "sum(rate(billing_payments_total[5m])) * 60",
+     "legendFormat": "payments / min",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "O"
+    },
+    {
+     "expr": "sum(rate(notifications_sent_total[5m])) * 60",
+     "legendFormat": "notifications / min",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "T"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "title": "Logs from all services (search with the X-Request-ID to follow one request)",
+   "type": "logs",
+   "gridPos": {
+    "x": 0,
+    "y": 28,
+    "w": 24,
+    "h": 12
+   },
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "targets": [
+    {
+     "expr": "{service=~\".+-service|kong|debezium\"} |~ \"$search\"",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "sortOrder": "Descending"
+   }
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "search",
+    "label": "Search logs",
+    "type": "textbox",
+    "query": "",
+    "current": {
+     "value": ""
+    }
+   }
+  ]
+ }
+}

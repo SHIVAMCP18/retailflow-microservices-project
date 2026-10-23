@@ -1,0 +1,247 @@
+# The five business services. Every pod:
+#  - runs as a non-root user with a read-only root filesystem and no Linux capabilities
+#  - waits for its dependencies in an init container
+#  - registers itself in Consul using its pod IP (downward API)
+#  - mounts only the secrets it needs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: product-service, namespace: retailflow, labels: { app: product-service, tier: service } }
+spec:
+  replicas: 2       # two instances: Kong and Order Service pick one via Consul
+  selector: { matchLabels: { app: product-service } }
+  template:
+    metadata: { labels: { app: product-service, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z product-db 5432; do echo waiting for product-db; sleep 2; done"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: product-service
+          image: retailflow/product-service:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD } } }
+            - { name: DATABASE_URL, value: "postgresql://product_app:$(POSTGRES_PASSWORD)@product-db:5432/products" }
+            - { name: CONSUL_HTTP_ADDR, value: "http://consul:8500" }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 3001 }, { name: grpc, containerPort: 50051 }]
+          readinessProbe: { httpGet: { path: /health, port: 3001 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health, port: 3001 }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 256Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: jwt-public, mountPath: /run/secrets, readOnly: true }]
+      volumes:
+        - { name: jwt-public, secret: { secretName: jwt-public } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: customer-service, namespace: retailflow, labels: { app: customer-service, tier: service } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: customer-service } }
+  template:
+    metadata: { labels: { app: customer-service, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z customer-db 27017 && nc -z rabbitmq 5672; do echo waiting; sleep 2; done"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: customer-service
+          image: retailflow/customer-service:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: MONGO_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: MONGO_PASSWORD } } }
+            - { name: MONGO_URL, value: "mongodb://customer_app:$(MONGO_PASSWORD)@customer-db:27017/?authSource=admin" }
+            - { name: RABBITMQ_APP_USER, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_USER } } }
+            - { name: RABBITMQ_APP_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_PASSWORD } } }
+            - { name: RABBITMQ_URL, value: "amqp://$(RABBITMQ_APP_USER):$(RABBITMQ_APP_PASSWORD)@rabbitmq:5672/retailflow" }
+            - { name: ADMIN_EMAIL, valueFrom: { secretKeyRef: { name: app-secrets, key: ADMIN_EMAIL } } }
+            - { name: ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: ADMIN_PASSWORD } } }
+            - { name: CONSUL_HTTP_ADDR, value: "http://consul:8500" }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 256Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            # Only Customer Service gets the private signing key.
+            - { name: jwt-issuer, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: jwt-issuer, secret: { secretName: jwt-issuer } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: order-service, namespace: retailflow, labels: { app: order-service, tier: service } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: order-service } }
+  template:
+    metadata: { labels: { app: order-service, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z order-db 3306 && nc -z rabbitmq 5672 && nc -z consul 8500; do echo waiting; sleep 2; done"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: order-service
+          image: retailflow/order-service:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: MYSQL_ORDER_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: MYSQL_ORDER_PASSWORD } } }
+            - { name: RABBITMQ_APP_USER, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_USER } } }
+            - { name: RABBITMQ_APP_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_PASSWORD } } }
+            - { name: CONSUL_HOST, value: consul }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 8083 }]
+          startupProbe: { httpGet: { path: /actuator/health, port: 8083 }, periodSeconds: 5, failureThreshold: 36 }
+          readinessProbe: { httpGet: { path: /actuator/health, port: 8083 }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /actuator/health/liveness, port: 8083 }, periodSeconds: 15 }
+          resources: { requests: { cpu: 200m, memory: 384Mi }, limits: { memory: 768Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: jwt-public, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: jwt-public, secret: { secretName: jwt-public } }
+        - { name: tmp, emptyDir: {} }
+---
+# Scales Order Service between 1 and 3 pods on CPU (needs metrics-server; see README).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: order-service, namespace: retailflow }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: order-service }
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+# StatefulSet because SQLite is a file: one pod with its own persistent volume.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: billing-service, namespace: retailflow, labels: { app: billing-service, tier: service } }
+spec:
+  serviceName: billing-service
+  replicas: 1
+  selector: { matchLabels: { app: billing-service } }
+  template:
+    metadata: { labels: { app: billing-service, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        - name: wait-for-broker
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z rabbitmq 5672; do echo waiting for rabbitmq; sleep 2; done"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: billing-service
+          image: retailflow/billing-service:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: RABBITMQ_APP_USER, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_USER } } }
+            - { name: RABBITMQ_APP_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_PASSWORD } } }
+            - { name: RABBITMQ_URL, value: "amqp://$(RABBITMQ_APP_USER):$(RABBITMQ_APP_PASSWORD)@rabbitmq:5672/retailflow" }
+            - { name: CONSUL_HTTP_ADDR, value: "http://consul:8500" }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 8084 }]
+          readinessProbe: { httpGet: { path: /health, port: 8084 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health, port: 8084 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources: { requests: { cpu: 25m, memory: 32Mi }, limits: { memory: 128Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: jwt-public, mountPath: /run/secrets, readOnly: true }
+      volumes:
+        - { name: jwt-public, secret: { secretName: jwt-public } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 256Mi } } }
+---
+# Multi-container pod: the Notification Service plus a Mailpit sidecar that acts
+# as the pod's local SMTP server (localhost:1025) and web inbox (port 8025).
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: notification-service, namespace: retailflow, labels: { app: notification-service, tier: service } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: notification-service } }
+  template:
+    metadata: { labels: { app: notification-service, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1654, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z notification-db 6379 && nc -z rabbitmq 5672; do echo waiting; sleep 2; done"]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: notification-service
+          image: retailflow/notification-service:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: REDIS_HOST, value: "notification-db:6379" }
+            - { name: REDIS_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: REDIS_PASSWORD } } }
+            - { name: RABBITMQ_APP_USER, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_USER } } }
+            - { name: RABBITMQ_APP_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: RABBITMQ_APP_PASSWORD } } }
+            - { name: RABBITMQ_URL, value: "amqp://$(RABBITMQ_APP_USER):$(RABBITMQ_APP_PASSWORD)@rabbitmq:5672/retailflow" }
+            - { name: SMTP_HOST, value: localhost }
+            - { name: SMTP_PORT, value: "1025" }
+            - { name: CONSUL_HTTP_ADDR, value: "http://consul:8500" }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 8085 }]
+          readinessProbe: { httpGet: { path: /health, port: 8085 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health, port: 8085 }, initialDelaySeconds: 15, periodSeconds: 10 }
+          resources: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 256Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: jwt-public, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+        - name: mailpit
+          image: axllent/mailpit:v1.21
+          ports: [{ name: smtp, containerPort: 1025 }, { name: inbox, containerPort: 8025 }]
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 64Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes:
+        - { name: jwt-public, secret: { secretName: jwt-public } }
+        - { name: tmp, emptyDir: {} }
+---
+# The React website (nginx). Routed by Kong at "/", registered in Consul like the services.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web-ui, namespace: retailflow, labels: { app: web-ui, tier: service } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: web-ui } }
+  template:
+    metadata: { labels: { app: web-ui, tier: service } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: web-ui
+          image: retailflow/web-ui:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: CONSUL_HTTP_ADDR, value: "http://consul:8500" }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 64Mi } }

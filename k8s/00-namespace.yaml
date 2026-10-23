@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: retailflow
+  labels:
+    # Database images need root for their first start, so the namespace enforces
+    # "baseline"; every RetailFlow service pod also meets "restricted" (warn/audit).
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

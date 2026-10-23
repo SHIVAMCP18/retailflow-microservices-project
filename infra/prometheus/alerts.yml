@@ -1,0 +1,21 @@
+groups:
+  - name: retailflow
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} ({{ $labels.instance }}) is not responding" }
+      - alert: CircuitBreakerOpen
+        expr: resilience4j_circuitbreaker_state{state="open"} == 1
+        labels: { severity: warning }
+        annotations: { summary: "Order Service circuit breaker '{{ $labels.name }}' is OPEN" }
+      - alert: GatewayErrorRate
+        expr: sum(rate(kong_http_requests_total{code=~"5.."}[1m])) / sum(rate(kong_http_requests_total[1m])) > 0.2
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "More than 20% of gateway requests fail" }
+      - alert: MessagesInDeadLetterQueue
+        expr: sum(rabbitmq_queue_messages_ready{queue=~".*\\.dlq"}) > 0
+        labels: { severity: warning }
+        annotations: { summary: "Messages are waiting in a dead-letter queue" }

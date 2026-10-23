@@ -1,0 +1,99 @@
+# Zero-trust networking inside the namespace: all inbound traffic is denied,
+# then only the connections the architecture needs are allowed.
+# (Enforced by CNIs with NetworkPolicy support: kindnet in kind >= 0.24, Calico, Cilium.)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: retailflow }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Public entry points: the HTTPS gateway and the Grafana dashboard.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-public-entry, namespace: retailflow }
+spec:
+  podSelector: { matchExpressions: [{ key: app, operator: In, values: [kong, grafana] }] }
+  ingress: [{}]
+---
+# Business services accept traffic from the gateway, Consul health checks,
+# Prometheus scraping, and Order Service (REST to Customer, gRPC to Product).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-to-services, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { tier: service } }
+  ingress:
+    - from:
+        - podSelector: { matchExpressions: [{ key: app, operator: In, values: [kong, consul, prometheus, order-service] }] }
+---
+# Each database only accepts its owning service (database per service).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: product-db-owner-only, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: product-db } }
+  ingress: [{ from: [{ podSelector: { matchLabels: { app: product-service } } }], ports: [{ port: 5432 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: customer-db-owner-only, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: customer-db } }
+  ingress: [{ from: [{ podSelector: { matchLabels: { app: customer-service } } }], ports: [{ port: 27017 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: order-db-owner-and-cdc, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: order-db } }
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: order-service } }
+        - podSelector: { matchLabels: { app: debezium } }   # reads the binlog for CDC
+      ports: [{ port: 3306 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: notification-db-owner-only, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: notification-db } }
+  ingress: [{ from: [{ podSelector: { matchLabels: { app: notification-service } } }], ports: [{ port: 6379 }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: rabbitmq-clients, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: rabbitmq } }
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { tier: service } }
+        - podSelector: { matchExpressions: [{ key: app, operator: In, values: [debezium, rabbitmq-init] }] }
+      ports: [{ port: 5672 }, { port: 15672 }]
+    - from: [{ podSelector: { matchLabels: { app: prometheus } } }]
+      ports: [{ port: 15692 }]
+---
+# Every pod in the namespace may register with / query the discovery service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: consul-from-namespace, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: consul } }
+  ingress: [{ from: [{ podSelector: {} }] }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: observability, namespace: retailflow }
+spec:
+  podSelector: { matchExpressions: [{ key: app, operator: In, values: [prometheus, loki] }] }
+  ingress:
+    - from:
+        - podSelector: { matchExpressions: [{ key: app, operator: In, values: [grafana, promtail] }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: kong-metrics, namespace: retailflow }
+spec:
+  podSelector: { matchLabels: { app: kong } }
+  ingress: [{ from: [{ podSelector: { matchLabels: { app: prometheus } } }], ports: [{ port: 8100 }] }]

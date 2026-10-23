@@ -1,0 +1,168 @@
+# Monitoring (Prometheus + Grafana) and centralised logging (Promtail -> Loki).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: retailflow, labels: { app: prometheus } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata: { labels: { app: prometheus } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 65534, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--web.enable-lifecycle"]
+          ports: [{ containerPort: 9090 }]
+          readinessProbe: { httpGet: { path: /-/ready, port: 9090 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - { name: config, configMap: { name: prometheus-config } }   # same file as Docker Compose (Consul SD)
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: retailflow }
+spec: { selector: { app: prometheus }, ports: [{ port: 9090 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: loki, namespace: retailflow, labels: { app: loki } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loki } }
+  template:
+    metadata: { labels: { app: loki } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: loki
+          image: grafana/loki:3.2.1
+          args: ["-config.file=/etc/loki/loki.yml"]
+          ports: [{ containerPort: 3100 }]
+          readinessProbe: { httpGet: { path: /ready, port: 3100 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/loki }
+            - { name: data, mountPath: /loki }
+      volumes:
+        - { name: config, configMap: { name: loki-config } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: loki, namespace: retailflow }
+spec: { selector: { app: loki }, ports: [{ port: 3100 }] }
+---
+# Promtail runs once per node (DaemonSet), reads the container log files of the
+# retailflow namespace and pushes them to Loki with a "service" label.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: promtail, namespace: retailflow }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: retailflow-promtail }
+rules:
+  - { apiGroups: [""], resources: [pods, nodes], verbs: [get, list, watch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: retailflow-promtail }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: retailflow-promtail }
+subjects: [{ kind: ServiceAccount, name: promtail, namespace: retailflow }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: promtail-config, namespace: retailflow }
+data:
+  promtail.yml: |
+    server: { http_listen_port: 9080, grpc_listen_port: 0 }
+    positions: { filename: /run/promtail/positions.yaml }
+    clients: [{ url: "http://loki:3100/loki/api/v1/push" }]
+    scrape_configs:
+      - job_name: pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: { names: [retailflow] }
+        pipeline_stages: [{ cri: {} }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_node_name], target_label: __host__ }
+          - { source_labels: [__meta_kubernetes_pod_label_app], target_label: service }
+          - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+          - { source_labels: [__meta_kubernetes_pod_container_name], target_label: container }
+          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+            separator: /
+            target_label: __path__
+            replacement: /var/log/pods/*$1/*.log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: promtail, namespace: retailflow, labels: { app: promtail } }
+spec:
+  selector: { matchLabels: { app: promtail } }
+  template:
+    metadata: { labels: { app: promtail } }
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.2.1
+          args: ["-config.file=/etc/promtail/promtail.yml"]
+          env: [{ name: HOSTNAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }]
+          resources: { requests: { cpu: 25m, memory: 64Mi }, limits: { memory: 192Mi } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/promtail }
+            - { name: pods, mountPath: /var/log/pods, readOnly: true }
+            - { name: positions, mountPath: /run/promtail }
+      volumes:
+        - { name: config, configMap: { name: promtail-config } }
+        - { name: pods, hostPath: { path: /var/log/pods } }
+        - { name: positions, emptyDir: {} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: grafana, namespace: retailflow, labels: { app: grafana } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata: { labels: { app: grafana } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 472, fsGroup: 472, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.3.0
+          env:
+            - { name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: app-secrets, key: GRAFANA_ADMIN_PASSWORD } } }
+            - { name: GF_USERS_ALLOW_SIGN_UP, value: "false" }
+            - { name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana/dashboards/retailflow.json }
+          ports: [{ containerPort: 3000 }]
+          readinessProbe: { httpGet: { path: /api/health, port: 3000 }, periodSeconds: 10 }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 384Mi } }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: dashboard-provider, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards, mountPath: /var/lib/grafana/dashboards }
+      volumes:
+        - { name: datasources, configMap: { name: grafana-datasources } }
+        - { name: dashboard-provider, configMap: { name: grafana-dashboard-provider } }
+        - { name: dashboards, configMap: { name: grafana-dashboards } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: grafana, namespace: retailflow }
+spec:
+  type: NodePort
+  selector: { app: grafana }
+  ports: [{ port: 3000, nodePort: 30300 }]
